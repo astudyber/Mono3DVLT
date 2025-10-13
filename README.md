@@ -52,7 +52,13 @@ The Mono3DVLT task focuses on 3D single object tracking from a monocular video g
 
 </div>
 
+## 📂 Code Release
+We have **open-sourced part of our implementation** to help the community explore and reproduce results.  
+You are encouraged to:
 
+- Reproduce and verify the released modules  
+- Implement or improve other components  
+- Contribute new ideas for monocular 3D visual grounding  
 
 ## **🗃️ Dataset**
 
@@ -210,3 +216,4 @@ Fig.6 Visualization of Comparing our model's results with those of the best-perf
   pages   = {13886-13896}
 }
 ```
+
