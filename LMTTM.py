@@ -8,8 +8,6 @@ import numpy as np
 import torchvision.models as models
 
 class PreProcess3D(nn.Module): 
-    # Input：Batch, Channels, Step, H, W  
-    # Output：Batch, Step, Tokens, Channels
     def __init__(self,config) -> None:
         super(PreProcess3D, self).__init__()
         self.conv = nn.Conv3d(in_channels=1, 
@@ -21,8 +19,6 @@ class PreProcess3D(nn.Module):
 
     def forward(self, input):
 
-        # input = input.transpose(1, 2)
-
         x = self.conv(input)
         x = self.relu(x)
         x = x.flatten(3)
@@ -30,8 +26,6 @@ class PreProcess3D(nn.Module):
         return x
     
 class PreProcess3DWithBN(nn.Module): 
-    # Input：Batch, Channels, Step, H, W  
-    # Output：Batch, Step, Tokens, Channels
     def __init__(self,config) -> None:
         super(PreProcess3DWithBN, self).__init__()
         self.conv = nn.Conv3d(in_channels=config["model"]["in_channels"], 
@@ -49,7 +43,6 @@ class PreProcess3DWithBN(nn.Module):
         self.bn2 = nn.BatchNorm3d(config["model"]["dim"])
 
     def forward(self, input):
-        # input = input.transpose(1, 2)
         x = self.conv(input)
         x = self.bn1(x)
         x = self.relu(x)
@@ -67,8 +60,6 @@ class PreProcessResnet18(nn.Module):
         super(PreProcessResnet18, self).__init__()
         self.resnet = models.resnet18(pretrained=False).cuda()
         self.resnet.fc = nn.Identity()
-        # for param in self.resnet.parameters():
-        #     param.requires_grad = False
     def forward(self, x):
         batch_size, channels, steps, height, width = x.size()
         x = x.view(batch_size*steps, channels, height, width)
@@ -78,9 +69,7 @@ class PreProcessResnet18(nn.Module):
         x = self.resnet.maxpool(x)
 
         x = self.resnet.layer1(x)
-        x = self.resnet.layer2(x)#128
-        # x = self.resnet.layer3(x) #256
-        # x = self.resnet.layer4(x)#512
+        x = self.resnet.layer2(x)
         he, dim, h, w = x.shape
         x=x.view(batch_size,steps,-1,dim)
         return x
@@ -92,7 +81,6 @@ class TokenLearnerMHA(nn.Module):
         self.attn = nn.MultiheadAttention(embed_dim=config["model"]["dim"], num_heads=8, dropout=config["model"]["drop_r"], batch_first=True)
 
     def forward(self, input):
-        # [0]is output,[1]is weight
         return self.attn(self.query, input, input)[0]
 
 class TokenAddEraseWrite(nn.Module):
@@ -161,8 +149,6 @@ class TokenAddEraseWrite(nn.Module):
         output = self.fn(output)
         output = self.relu(output)
         output = output.transpose(1,2)
-        # Changing the Output Shape
-        # output = self.trans_outdim(self.query, output, output)[0]
 
         return output
 
@@ -184,7 +170,6 @@ class LinkedMemoryTTM(nn.Module):
 
     def ReadFromDNC(self, memory_tokens):
         self.SplitMemoryTokens(memory_tokens)
-        # 遍历每个Memory_tokens块及其相邻的2块
         k = self.current_flag % self.num_blocks
         
         current_memory_block = self.split_memory_tokens[k]
@@ -241,10 +226,6 @@ class TokenTuringMachineUnit(nn.Module):
         current_all_tokens = torch.cat((current_memory_block, input_tokens), dim=1)
         prev_all_tokens = torch.cat((prev_memory_block, input_tokens), dim=1)
         next_all_tokens = torch.cat((next_memory_block, input_tokens), dim=1)
-        # prev_all_tokens = prev_memory_block
-        # next_all_tokens = next_memory_block
-
-        # Read add posiutional
         if self.config["model"]["Read_use_positional_embedding"]:
             current_all_tokens = current_all_tokens.cuda()
             prev_all_tokens = prev_all_tokens.cuda()
@@ -274,9 +255,8 @@ class TokenTuringMachineUnit(nn.Module):
                 output_tokens = self.transformerBlock(output_tokens)
 
         elif self.config["model"]["process_unit"] == 'mixer':
-            output_tokens = all_tokens # all_tokens shape is [batch,mem_size+special_num_token,config["model"]["dim"]]
+            output_tokens = all_tokens 
             for _ in range(self.num_layers):
-                # Token mixing,different token interoperability
                 x_output_tokens = output_tokens
                 x_output_tokens = self.norm(x_output_tokens)
                 x_output_tokens = x_output_tokens.permute(0, 2, 1) 
@@ -285,7 +265,6 @@ class TokenTuringMachineUnit(nn.Module):
                 x_output_tokens = x_output_tokens + output_tokens
                 x_output_tokens = self.dropout(x_output_tokens)
 
-                # Channel mixing,internal token interoperability
                 y_output_tokens = self.norm(x_output_tokens)
                 y_output_tokens = self.mixer_channels__block(y_output_tokens)
                 y_output_tokens = self.dropout(y_output_tokens)
@@ -301,13 +280,12 @@ class TokenTuringMachineUnit(nn.Module):
             
         memory_input_tokens = torch.cat((current_memory_block, prev_memory_block, next_memory_block, input_tokens, output_tokens), dim=1)
 
-        # Write add posiutional
         if self.config["model"]["Write_use_positional_embedding"]:
             memory_input_tokens = memory_input_tokens.cuda()
             posemb_init = torch.nn.Parameter(torch.empty(
                 1, memory_input_tokens.size(1), memory_input_tokens.size(2))).cuda()
             init.normal_(posemb_init, std=0.02)
-            # mem_out_tokens shape is [batch,mem_size+special_num_token,config["model"]["dim"]]
+
             memory_input_tokens = memory_input_tokens + posemb_init
 
         if self.config["model"]["memory_mode"] == 'TL':
@@ -351,27 +329,17 @@ class TokenTuringMachineEncoder(nn.Module):
         
         if memory_tokens == None:
             memory_tokens = torch.zeros(b,self.config["model"]["memory_tokens_size"],c).cuda() #  c, h, w
-            # np.random.seed(3407)
-            # random_tokens = torch.rand(b, self.config["model"]["memory_tokens_size"], c).cuda()
-            # memory_tokens = torch.exp(random_tokens)
+
         else:
             memory_tokens = memory_tokens.detach()
         
         for i in range(t):
-            # 将Memory_tokens分成多块
             current_memory_block, prev_memory_block, next_memory_block = self.simpleDNC.ReadFromDNC(memory_tokens)
 
-            # 遍历每个Memory_tokens块及其相邻的2块
             write_memory_block, out = self.tokenTuringMachineUnit(current_memory_block, prev_memory_block, next_memory_block, input[:, i, :, :])
             memory_tokens = self.simpleDNC.WriteToDNC(write_memory_block)
             outs.append(out)
     
-        # outs = torch.stack(outs, dim=1)
-        # out = outs.view(self.config["batch_size"], -1, self.config["model"]["dim"])
-        # out = out.transpose(1, 2)
-        # out = nn.AdaptiveAvgPool1d(1)(out) 
-        # out = out.squeeze(2)
-
         if self.config["model"]["load_memory_add_noise"]:
             np.random.seed(3407)
             if self.config["model"]["load_memory_add_noise_mode"] == "normal":
@@ -412,8 +380,3 @@ class TokenTuringMachineEncoder(nn.Module):
 
         return out, memory_tokens
     
-# if __name__ == "__main__":
-#     inputs = torch.randn(config["batch_size"], config["model"]["step"], 1, 28, 28).cuda() # [bs, config["model"]["step"], c, h, w]
-#     model = TokenTuringMachineEncoder().cuda()
-#     out, mem = model(inputs)
-#     print(out.shape)

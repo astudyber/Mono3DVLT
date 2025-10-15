@@ -10,7 +10,7 @@ from utils.misc import inverse_sigmoid
 from .ops.modules import MSDeformAttn
 from .LMTTM import TokenTuringMachineEncoder
 
-class TextGuidedAdapter(nn.Module):   #文本引导图像 通过加权文本对应的图像特征 
+class TextGuidedAdapter(nn.Module):
     def __init__(self, d_model=256, 
                  dropout=0.1,
                  n_levels=4,
@@ -18,7 +18,6 @@ class TextGuidedAdapter(nn.Module):   #文本引导图像 通过加权文本对�
                  n_points=4,):
         super().__init__()
 
-        # img2text: Cross attention
         self.img2text_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         
         self.adapt_proj = MLP(input_dim=256, hidden_dim=256, output_dim=256, num_layers=1)
@@ -31,16 +30,13 @@ class TextGuidedAdapter(nn.Module):   #文本引导图像 通过加权文本对�
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear')
         self.downsample = nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, return_indices=False, ceil_mode=False)
 
-        # img2img: Multi-Scale Deformable Attention
         self.img2img_msdeform_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
 
         self.norm_text_cond_img = nn.LayerNorm(d_model)
         self.norm_img = nn.LayerNorm(d_model)
 
-        # depth2text: Cross attention
         self.depth2textcross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
 
-        # depth2depth: Cross attention
         self.depth2depth_attn =  nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
 
         self.norm_text_cond_depth = nn.LayerNorm(d_model)
@@ -58,69 +54,64 @@ class TextGuidedAdapter(nn.Module):   #文本引导图像 通过加权文本对�
                 word_pos=None):
         orig_multiscale_img_feat = img_feat_src
         orig_multiscale_masks = masks
-        orig_multiscale_img_pos_embeds = img_pos_embeds   #前3个 
+        orig_multiscale_img_pos_embeds = img_pos_embeds
 
-        # split four level multi-scale img_feat/masks/img_pos_embeds
         bs, sum, dim = img_feat_src.shape
-        img_feat_src_list = img_feat_src.split([H_ * W_ for H_, W_ in spatial_shapes], dim=1) #在dim=1上面来切分 也就是seqense序列上切分
+        img_feat_src_list = img_feat_src.split([H_ * W_ for H_, W_ in spatial_shapes], dim=1) 
         masks_list = masks.split([H_ * W_ for H_, W_ in spatial_shapes], dim=1)
         img_pos_embeds_list = img_pos_embeds.split([H_ * W_ for H_, W_ in spatial_shapes], dim=1)
-        #分成对应层级大小的特征
-        # For second level img_feat/masks/img_pos_embeds to compute score   #用第二个层级的特征计算分数
+
         img_feat_src = img_feat_src_list[1]
         masks = masks_list[1]
         img_pos_embeds = img_pos_embeds_list[1]
 
                     
-        q = self.with_pos_embed(img_feat_src, img_pos_embeds)  # q是图像特征
-        k = self.with_pos_embed(word_feat, word_pos)   #k是文本特征 加了位置罢了
+        q = self.with_pos_embed(img_feat_src, img_pos_embeds) 
+        k = self.with_pos_embed(word_feat, word_pos)   
         imgfeat_adapt = self.img2text_attn(query=q.transpose(0, 1),    
                                   key=k.transpose(0, 1),
                                   value=word_feat.transpose(0, 1),
-                                  key_padding_mask=word_key_padding_mask)[0].transpose(0, 1) #做query 计算atten    q  tokens batch dim ,k tokens batch,dim
+                                  key_padding_mask=word_key_padding_mask)[0].transpose(0, 1) 
 
-        imgfeat_adapt_embed = self.adapt_proj(imgfeat_adapt)  #  文本融合过的   [bs, 1920, 256]  #映射到元图  根据文本信息处理得到的图像
-        imgfeat_orig_embed = self.orig_proj(img_feat_src)  #原本就有的
+        imgfeat_adapt_embed = self.adapt_proj(imgfeat_adapt) 
+        imgfeat_orig_embed = self.orig_proj(img_feat_src)
 
         verify_score = (F.normalize(imgfeat_orig_embed, p=2, dim=-1) *
-                        F.normalize(imgfeat_adapt_embed, p=2, dim=-1)).sum(dim=-1, keepdim=True)   #L2范数进行归一化 点乘[1,1920,1]
+                        F.normalize(imgfeat_adapt_embed, p=2, dim=-1)).sum(dim=-1, keepdim=True)
         verify_score = self.tf_scale * \
                        torch.exp( - (1 - verify_score).pow(self.tf_pow) \
-                        / (2 * self.tf_sigma**2))   # [12, 1920, 1]
-       #[1, 1920, 1]
-        # For score of map-16 to upsample and downsample  #对16层级的分数进行上采样和下采样 
-        verify_score_16 = verify_score.reshape(bs, spatial_shapes[1][0], spatial_shapes[1][1], 1).squeeze(-1)#verify_score ->[1, 24, 80]) 
+                        / (2 * self.tf_sigma**2))  
+
+        verify_score_16 = verify_score.reshape(bs, spatial_shapes[1][0], spatial_shapes[1][1], 1).squeeze(-1)
         verify_score_8 = self.upsample(verify_score_16.unsqueeze(1)).squeeze(1)
         verify_score_8 = verify_score_8[:,:-1,:]
         verify_score_32 = self.downsample(verify_score_16)
         verify_score_64 = self.downsample(verify_score_32)
         verify_score_list = [verify_score_8.flatten(1), verify_score_16.flatten(1),verify_score_32.flatten(1), verify_score_64.flatten(1)]
-        verify_score = torch.cat(verify_score_list, dim=1).unsqueeze(-1) #这不就是对图像mutil level 做融合拼接吗
+        verify_score = torch.cat(verify_score_list, dim=1).unsqueeze(-1)
 
-        q = k = img_feat_src + imgfeat_adapt   # second image feature   #第二层原有的+融入文本信息的处理后的图像
-        # concat multi-scale image feature
-        src = torch.cat([img_feat_src_list[0],q ,img_feat_src_list[2],img_feat_src_list[3]], 1)  #拼接多尺度的图像特征 未加入文本特征的
+        q = k = img_feat_src + imgfeat_adapt
 
-        reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]# 1 1 4 2 ,
+        src = torch.cat([img_feat_src_list[0],q ,img_feat_src_list[2],img_feat_src_list[3]], 1)
+
+        reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
 
         text_cond_img_ctx = self.img2img_msdeform_attn(
                             self.with_pos_embed(src, orig_multiscale_img_pos_embeds),
                             reference_points_input, orig_multiscale_img_feat, spatial_shapes,
-                                  level_start_index, orig_multiscale_masks)#NOTE 这里没看懂,是得到了增强后的文本特征吗
+                                  level_start_index, orig_multiscale_masks)
 
-        # adapted image feature
+
         adapt_img_feat = (self.norm_img(orig_multiscale_img_feat) + self.norm_text_cond_img(text_cond_img_ctx)) * verify_score
-#adapt_img_feat 可能包含了更关注文本语义的图像特征表达，这对于后续的目标检测或其他视觉任务可能具有重要的影响
-        # text-guided depth encoder
+
         depthfeat_adapt = self.depth2textcross_attn(
             query=depth_pos_embed,
             key=self.with_pos_embed(word_feat, word_pos).transpose(0, 1),
             value=word_feat.transpose(0, 1), key_padding_mask=word_key_padding_mask)[0]
 
-        q = k = depth_pos_embed + depthfeat_adapt   # depth feature of second image
+        q = k = depth_pos_embed + depthfeat_adapt
         text_cond_depth = self.depth2depth_attn(query=q, key=k, value=depth_pos_embed, key_padding_mask=mask_depth)[0]
 
-        # adapted depth feature
         adapt_depth_feat = (self.norm_depth(depth_pos_embed.transpose(0, 1)) + self.norm_text_cond_depth(text_cond_depth.transpose(0, 1))) * verify_score_16.flatten(1).unsqueeze(-1)
         adapt_depth_feat = adapt_depth_feat.transpose(0, 1)
         return torch.cat([orig_multiscale_img_feat, adapt_img_feat], dim=-1), torch.cat([depth_pos_embed, adapt_depth_feat], dim=-1)
@@ -183,11 +174,8 @@ class Mono3DVGTransformer(nn.Module):
 
         dim_t = torch.arange(num_pos_feats, dtype=torch.float32, device=proposals.device)
         dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
-        # N, L, 4
         proposals = proposals.sigmoid() * scale
-        # N, L, 4, 128
         pos = proposals[:, :, :, None] / dim_t
-        # N, L, 4, 64, 2
         pos = torch.stack((pos[:, :, :, 0::2].sin(), pos[:, :, :, 1::2].cos()), dim=4).flatten(2)
         return pos
 
@@ -240,7 +228,6 @@ class Mono3DVGTransformer(nn.Module):
                 text_memory=None, text_mask=None,  im_name=None, instanceID=None, ann_id=None):
         assert query_embed is not None
 
-        # prepare input for encoder
         src_flatten = []
         mask_flatten = []
         lvl_pos_embed_flatten = []
@@ -281,14 +268,14 @@ class Mono3DVGTransformer(nn.Module):
         depth_pos_embed = depth_pos_embed.flatten(2).permute(2, 0, 1)  # ([1, 256, 24, 80]) -->  ([1920, 1, 256])
         mask_depth = masks[1].flatten(1)
 
-        # prepare for adapter  对编码后的图像特征、深度信息、文本信息进行融合和调整，得到适配后的图像特征和深度特征。
+        # prepare for adapter
         img_feat_orig2adapt, depth_feat_orig2adapt = self.TextGuidedAdapter(memory, mask_flatten, lvl_pos_embed_flatten,
                 reference_points, spatial_shapes,
                 level_start_index,
                 valid_ratios,
                 text_memory, text_mask, depth_pos_embed, mask_depth, im_name, instanceID, ann_id)
-#([1, 10200, 512])    ,,,,  rch.Size([1920, 1, 512])
-        img_feat_srcs = img_feat_orig2adapt.chunk(2, dim=-1)#最后一个维度均分
+
+        img_feat_srcs = img_feat_orig2adapt.chunk(2, dim=-1)
         memory_adapt_k = img_feat_srcs[1]
         depth_feat_srcs = depth_feat_orig2adapt.chunk(2, dim=-1)
         depth_adapt_k = depth_feat_srcs[1]
@@ -348,14 +335,13 @@ class VisualEncoderLayer(nn.Module):
         src = src + self.dropout3(src2)
         src = self.norm2(src)
         return src
-############Q做 图像特征 K做文本特征 V 是文本特征？？？？   不应该文本指导   文本做query  图像做key value吗
+
     def forward(self, src, pos, reference_points, spatial_shapes, level_start_index ,text_memory, text_mask, padding_mask=None):
-        # Multi-Scale Deformable Attention
+
         src2 = self.msdeform_attn(self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, level_start_index, padding_mask)
         src = src + self.dropout1(src2)
-        src = self.norm1(src)#残差
+        src = self.norm1(src)
 
-        # cross attention
         src3 = self.cross_attn(query = self.with_pos_embed(src, pos).transpose(0, 1),
                                key = self.with_pos_embed(text_memory, torch.zeros_like(text_memory)).transpose(0, 1),
                                value= text_memory.transpose(0, 1)
@@ -363,7 +349,6 @@ class VisualEncoderLayer(nn.Module):
         src = src + self.dropout4(src3)
         src = self.norm3(src)
 
-        # ffn
         src = self.forward_ffn(src)
         return src, text_memory
 
@@ -383,21 +368,21 @@ class VisualEncoder(nn.Module):
                                           torch.linspace(0.5, W_ - 0.5, W_, dtype=torch.float32, device=device))  #生成网课点的坐标  # torch.Size([24, 80])
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H_)  
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W_)
-            ref = torch.stack((ref_x, ref_y), -1)      # xy
-            reference_points_list.append(ref)   #torch.Size([1, 7680, 2])
+            ref = torch.stack((ref_x, ref_y), -1)
+            reference_points_list.append(ref)  
         reference_points = torch.cat(reference_points_list, 1)
         reference_points = reference_points[:, :, None] * valid_ratios[:, None]
         return reference_points
 
     def forward(self, src, spatial_shapes, level_start_index, valid_ratios,text_memory, text_mask,
                 pos=None, padding_mask=None):
-        output = src   #已经拼接好的特征
+        output = src  
         text_output = text_memory
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         for _, layer in enumerate(self.layers):
             output, text_output = layer(output, pos, reference_points, spatial_shapes, level_start_index,text_output, text_mask, padding_mask)
 
-        return output, text_output   #
+        return output, text_output 
 
 
 class Mono3DVGDecoderLayer(nn.Module):
@@ -406,22 +391,18 @@ class Mono3DVGDecoderLayer(nn.Module):
                  n_levels=4, n_heads=8, n_points=4):
         super().__init__()
 
-        # cross attention
         self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
 
-        # text cross attention
         self.cross_attn_text = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout_text = nn.Dropout(dropout)
         self.norm_text = nn.LayerNorm(d_model)
 
-        # depth cross attention
         self.cross_attn_depth = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout_depth = nn.Dropout(dropout)
         self.norm_depth = nn.LayerNorm(d_model)
 
-        # ffn
         self.linear1 = nn.Linear(d_model, d_ffn)
         self.activation = _get_activation_fn(activation)
         self.dropout3 = nn.Dropout(dropout)
@@ -452,7 +433,6 @@ class Mono3DVGDecoderLayer(nn.Module):
                 mask_depth,
                 text_memory, text_mask):
 
-        # Gather depth feats based on the text info
         tgt3 = self.cross_attn_depth(
                                     tgt.transpose(0, 1),
                                     depth_adapt_k,
@@ -460,21 +440,20 @@ class Mono3DVGDecoderLayer(nn.Module):
                                      key_padding_mask=mask_depth)[0].transpose(0, 1)
         tgt2 = self.dropout_depth(tgt3)
         tgt2 = self.norm_depth(tgt2)
-        # Aggregate text info about the object
+
         tgt_text = self.cross_attn_text(self.with_pos_embed(tgt2, query_pos).transpose(0, 1),
                                         text_memory.transpose(0, 1),
                                         text_memory.transpose(0, 1),
                                         key_padding_mask=text_mask)[0].transpose(0, 1)
         tgt2 = self.dropout_text(tgt_text)
         tgt2 = self.norm_text(tgt2)
-        # Gather visual feats based on the linguistic info
+
         tgt3 = self.cross_attn(self.with_pos_embed(tgt2, query_pos),
                                reference_points,
                                src, src_spatial_shapes, level_start_index, src_padding_mask)
         tgt2 = tgt + self.dropout1(tgt3)#1  1 256
         tgt = self.norm1(tgt2)
 
-        # ffn
         tgt = self.forward_ffn(tgt)
 
         return tgt
@@ -486,7 +465,7 @@ class Mono3DVGDecoder(nn.Module):
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
         self.return_intermediate = return_intermediate
-        # hack implementation for iterative bounding box refinement and two-stage Deformable DETR
+
         self.bbox_embed = None
         self.dim_embed = None
         self.class_embed = None
@@ -567,7 +546,6 @@ class Mono3DVGDecoder(nn.Module):
                            mask_depth,
                            text_memory, text_mask)
 
-            # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:
                 tmp = self.bbox_embed[lid](output)
                 if reference_points.shape[-1] == 6:
